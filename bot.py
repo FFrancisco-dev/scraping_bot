@@ -7,14 +7,18 @@ from telethon import TelegramClient, events as telethon_events
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils.media_group import MediaGroupBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import os
+from dotenv import load_workbook, load_dotenv # Cargador de entornos
 
-# =====================================================================
-# ⚙️ CONFIGURACIÓN GLOBAL
-# =====================================================================
-API_ID = 33921372 
-API_HASH = 'e73827472e0f9ac0c373334fb6fd9be2'
-TOKEN_BOT = "8783669241:AAEMJPDMiszC11X3UfR8C-IAFjI6yVq08L0"  # 👈 El token de @BotFather
-TU_TELEGRAM_ID = 7992906431          # 👈 TU ID de usuario real para que solo tú puedas meter contenido
+# Cargar las variables del archivo .env oculto
+load_dotenv()
+
+# ⚙️ CONFIGURACIÓN SEGURA DESDE EL ENTORNO
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+TOKEN_BOT = os.getenv("TOKEN_BOT")
+TU_TELEGRAM_ID = int(os.getenv("TU_TELEGRAM_ID"))
+
 
 # Mensaje para los privados de Sami (Tráfico de Chateamos)
 MENSAJE_BIENVENIDA_PRIVADO = (
