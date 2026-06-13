@@ -1,241 +1,184 @@
-import logging
-import asyncio
-import random
-import sqlite3
-from datetime import datetime
-from telethon import TelegramClient, events as telethon_events
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils.media_group import MediaGroupBuilder
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import os
-from dotenv import load_workbook, load_dotenv # Cargador de entornos
+import asyncio
+from datetime import datetime
+import sqlite3
+from dotenv import load_dotenv
 
-# Cargar las variables del archivo .env oculto
+# Librerías de Aiogram (El Bot Guardián)
+from aiogram import Bot, Dispatcher, executor, types
+
+# Librerías de Telethon (La cuenta de Sami que publica)
+from telethon import TelegramClient
+
+# Librería del Temporizador (El reloj)
+from apscheduler.schedulers.asyncio import AsyncioScheduler
+
+# 1. ⚙️ CARGAR CONFIGURACIÓN SEGURA
 load_dotenv()
 
-# ⚙️ CONFIGURACIÓN SEGURA DESDE EL ENTORNO
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 TOKEN_BOT = os.getenv("TOKEN_BOT")
 TU_TELEGRAM_ID = int(os.getenv("TU_TELEGRAM_ID"))
 
+# 🚫 LISTA NEGRA DE PALABRAS PROHIBIDAS (Moderación)
+PALABRAS_PROHIBIDAS = [
+    "contenido prohibido", 
+    "cp", 
+    "pack", 
+    "telegram.me/", 
+    "t.me/", 
+    "links",
+    "intercambio"
+]
 
-# Mensaje para los privados de Sami (Tráfico de Chateamos)
-MENSAJE_BIENVENIDA_PRIVADO = (
-    "¡Hola, qué bueno tenerte por aquí! 😏\n\n"
-    "No te quedes en la puerta. Si quieres *conocer gente genial*, compartir contenido exclusivo y hablar  "
-    " con el resto de las chicas del grupo, únete ya. ¡El acceso es libre y el contenido gratis!\n\n"
-    "Haz clic aquí para entrar:👉https://t.me/+iAsjgGQAhvY1ZmU0 🚀\n\n"
-    "¡Te veo dentro, no te lo pierdas!"
-)
+# ID del grupo donde se publicará y se moderará (Se auto-detectará al recibir contenido)
+ID_GRUPO_COMUNIDAD = None 
 
-logging.basicConfig(level=logging.INFO)
-DB_NAME = "comunidad.db"
-
-# Inicialización de clientes
-client = TelegramClient('sesion_bot_telegram', API_ID, API_HASH)
+# 2. 🔌 INICIALIZACIÓN DE MOTORES
 bot = Bot(token=TOKEN_BOT)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
+dp = Dispatcher(bot)
+client = TelegramClient('sesion_sami', API_ID, API_HASH)
+scheduler = AsyncioScheduler()
 
-usuarios_respondidos = []
-ID_DEL_GRUPO = None # Se detectará automáticamente cuando el bot reciba el primer usuario o mensaje
-
-# =====================================================================
-# 🗄️ BASE DE DATOS LOCAL (SQLite)
-# =====================================================================
+# 🗄️ FUNCION PARA LA BASE DE DATOS
 def inicializar_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect("comunidad.db")
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS contenidos (
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS contenido (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            id_bloque TEXT,
             tipo TEXT,
-            contenido TEXT,
-            caption TEXT,
-            enviado INTEGER DEFAULT 0
+            file_id TEXT,
+            texto TEXT,
+            enviado INTEGER DEFAULT 0,
+            fecha_creacion TEXT
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
-# =====================================================================
-# 📬 SECCIÓN A: TELETHON (Auto-respondedor de Chateamos)
-# =====================================================================
-@client.on(telethon_events.NewMessage(incoming=True))
-async def manejador_de_privados(event):
-    if event.is_private:
-        remitente = await event.get_sender()
-        usuario_id = event.chat_id
-        
-        if remitente and not remitente.bot and usuario_id not in usuarios_respondidos:
-            nombre_usuario = remitente.first_name or "Usuario"
-            print(f"🔥 [Telethon] Mensaje privado de {nombre_usuario}")
-            await asyncio.sleep(random.uniform(2.0, 4.0))
-            await event.respond(MENSAJE_BIENVENIDA_PRIVADO)
-            usuarios_respondidos.append(usuario_id)
+inicializar_db()
 
 # =====================================================================
-# 🛡️ SECCIÓN B: AIOGRAM (Bot de Gestión, Registro y Mod del Grupo)
+# 👮‍♂️ PARTE A: EL BOT GUARDIÁN (Aiogram - Captura privado y Modera grupo)
 # =====================================================================
 
-# 🤝 Guardar contenido reenviado (Solo tú puedes hacerlo en el privado del Bot)
-@dp.message(lambda msg: msg.chat.type == "private" and msg.from_user.id == TU_TELEGRAM_ID)
-async def registrar_contenido(message: types.Message):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Generamos un identificador de bloque basado en el tiempo para poder agrupar álbumes
-    id_bloque = message.media_group_id if message.media_group_id else f"BL_SINGLE_{int(datetime.now().timestamp())}"
-    caption = message.caption if message.caption else ""
-    
-    tipo, contenido = None, None
-    
-    if message.text:
-        tipo, contenido = "texto", message.text
-    elif message.photo:
-        tipo, contenido = "foto", message.photo[-1].file_id  # Guardamos la foto con mejor calidad
+# Handler 1: Captura de contenido en privado (Solo tú puedes enviarle cosas)
+@dp.message_handler(chat_type=["private"])
+async def guardar_contenido_privado(message: types.Message):
+    if message.from_user.id != TU_TELEGRAM_ID:
+        return # Si no eres tú, el bot pasa de largo
+
+    tipo = "text"
+    file_id = None
+    texto = message.caption if message.caption else message.text
+
+    if message.photo:
+        tipo = "photo"
+        file_id = message.photo[-1].file_id
     elif message.video:
-        tipo, contenido = "video", message.video.file_id
-        
-    if tipo and contenido:
-        cursor.execute(
-            "INSERT INTO contenidos (id_bloque, tipo, contenido, caption) VALUES (?, ?, ?, ?)",
-            (id_bloque, tipo, contenido, caption)
-        )
-        conn.commit()
-        await message.answer(f"💾 Guardado con éxito en la base de datos (Tipo: {tipo})")
+        tipo = "video"
+        file_id = message.video.file_id
+
+    # Guardar en la base de datos
+    conn = sqlite3.connect("comunidad.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO contenido (tipo, file_id, texto, fecha_creacion) VALUES (?, ?, ?, ?)",
+        (tipo, file_id, texto, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+    await message.reply("💾 Guardado con éxito en la cola de publicación (Base de Datos).")
+
+
+# Handler 2: Moderador automático en el grupo (Con escudo para ti)
+@dp.message_handler(chat_type=["group", "supergroup"])
+async def moderar_mensajes_grupo(message: types.Message):
+    global ID_GRUPO_COMUNIDAD
+    ID_GRUPO_COMUNIDAD = message.chat.id # Guarda el ID del grupo dinámicamente
+
+    # 👑 ESCUDO PARA EL JEFE: Si eres tú el que escribe, el bot no te toca
+    if message.from_user.id == TU_TELEGRAM_ID:
+        return
+
+    texto_usuario = message.text.lower() if message.text else ""
+
+    # Verificar si infringe las normas
+    if any(palabra in texto_usuario for palabra in PALABRAS_PROHIBIDAS):
+        try:
+            # 1. Borrar el mensaje feo
+            await message.delete()
+            
+            # 2. Banear al usuario del grupo
+            await message.chat.kick(user_id=message.from_user.id)
+            
+            # 3. Poner aviso en el chat
+            await message.answer(
+                f"🚷 El usuario {message.from_user.first_name} ha sido **baneado** "
+                f"por incumplir las normas de la comunidad."
+            )
+        except Exception as e:
+            print(f"Error en moderación: {e}")
+
+
+# =====================================================================
+# ⏰ PARTE B: EL PUBLICADOR AUTOMÁTICO (Telethon + Cron - Cuenta Sami)
+# =====================================================================
+async def publicar_contenido_cron():
+    global ID_GRUPO_COMUNIDAD
+    if not ID_GRUPO_COMUNIDAD:
+        print("⚠️ Cron esperando a que se registre el ID del grupo...")
+        return
+
+    conn = sqlite3.connect("comunidad.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, tipo, file_id, texto FROM contenido WHERE enviado = 0 ORDER BY id ASC LIMIT 1")
+    fila = cursor.fetchone()
+
+    if fila:
+        id_db, tipo, file_id, texto = fila
+        try:
+            # Publicar usando la cuenta de Sami (Telethon)
+            if tipo == "text":
+                await client.send_message(ID_GRUPO_COMUNIDAD, texto)
+            elif tipo == "photo":
+                await client.send_file(ID_GRUPO_COMUNIDAD, file_id, caption=texto)
+            elif tipo == "video":
+                await client.send_file(ID_GRUPO_COMUNIDAD, file_id, caption=texto, video_note=False)
+
+            # Marcar como enviado
+            cursor.execute("UPDATE contenido SET enviado = 1 WHERE id = ?", (id_db,))
+            conn.commit()
+            print(f"✅ Publicado con éxito elemento ID {id_db} en el grupo.")
+        except Exception as e:
+            print(f"❌ Error al enviar post programado: {e}")
+    else:
+        print("💤 Cola vacía. No hay nada nuevo que publicar.")
     
     conn.close()
 
-# 🎉 Bienvenidas al Grupo
-# 👥 EVENTO: Alguien se une al grupo
-# 👥 EVENTO: Alguien se une al grupo (Corregido)
-# 👥 EVENTO: Alguien se une al grupo (Versión Ultra-Compatible)
-@dp.message(lambda message: message.new_chat_members)
-async def bienvenida_usuario(message: types.Message):
-    global ID_DEL_GRUPO
-    ID_DEL_GRUPO = message.chat.id  # Captura el ID del grupo dinámicamente
-    
-    # Recorremos los usuarios que acaban de entrar (por si entran varios de golpe)
-    for usuario in message.new_chat_members:
-        # Evitamos darnos la bienvenida a nosotros mismos (al bot)
-        if usuario.id == bot.id:
-            continue
-            
-        username = f"@{usuario.username}" if usuario.username else usuario.first_name
-        print(f"✨ [Grupo] {usuario.first_name} ({username}) ha entrado al grupo.")
-        
-        texto_bienvenida = (
-            f"¡Hola {username}! Bienvenido/a a nuestra comunidad. 🎉\n\n"
-            "Qué bueno tenerte por aquí. Preséntate, dinos de dónde eres "
-            "y ponte cómodo/a. ¡A disfrutar del grupo! 😊"
-        )
-        
-        await message.answer(texto_bienvenida)
-
-# 🚫 Moderación básica
-@dp.message()
-async def moderador_mensajes(message: types.Message):
-    global ID_DEL_GRUPO
-    if message.chat.type in ["group", "supergroup"]:
-        ID_DEL_GRUPO = message.chat.id
-
-    if message.new_chat_members or message.left_chat_member:
-        try: await message.delete()
-        except: pass
-        return
-
-    if message.text and ("http" in message.text or "t.me" in message.text):
-        try:
-            await message.delete()
-            aviso = await message.answer(f"⚠️ {message.from_user.first_name}, enlaces no permitidos.")
-            await asyncio.sleep(4)
-            await aviso.delete()
-        except: pass
 
 # =====================================================================
-# ⏰ RECOLECTOR Y PUBLICADOR AUTOMÁTICO (Cada 2 Horas)
-# =====================================================================
-async def publicar_contenido_cron():
-    global ID_DEL_GRUPO
-    if not ID_DEL_GRUPO:
-        print("⏰ [Reloj] Esperando a que el grupo tenga actividad para conocer su ID...")
-        return
-        
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Buscamos el primer bloque que no haya sido enviado
-    cursor.execute("SELECT id_bloque FROM contenidos WHERE enviado = 0 LIMIT 1")
-    fila = cursor.fetchone()
-    
-    if not fila:
-        print("⏰ [Reloj] Base de datos vacía o todo el contenido ya fue enviado.")
-        conn.close()
-        return
-        
-    id_bloque_objetivo = fila[0]
-    
-    # Extraemos todos los elementos que pertenezcan a ese mismo bloque (por si es un álbum)
-    cursor.execute("SELECT tipo, contenido, caption FROM contenidos WHERE id_bloque = ?", (id_bloque_objetivo,))
-    elementos = cursor.fetchall()
-    
-    try:
-        # CASO 1: Es un álbum multimedia (Múltiples fotos o vídeos)
-        if len(elementos) > 1:
-            media_group = MediaGroupBuilder()
-            for tipo, contenido, caption in elementos:
-                if tipo == "foto":
-                    media_group.add_photo(media=contenido, caption=caption if caption else None)
-                elif tipo == "video":
-                    media_group.add_video(media=contenido, caption=caption if caption else None)
-            
-            await bot.send_media_group(chat_id=ID_DEL_GRUPO, media=media_group.build())
-            print(f"🚀 [Reloj] Álbum enviado al grupo (Bloque: {id_bloque_objetivo})")
-            
-        # CASO 2: Es un elemento único (Texto, URL, 1 Foto o 1 Vídeo)
-        else:
-            tipo, contenido, caption = elementos[0]
-            if tipo == "texto":
-                await bot.send_message(chat_id=ID_DEL_GRUPO, text=contenido)
-            elif tipo == "foto":
-                await bot.send_photo(chat_id=ID_DEL_GRUPO, photo=contenido, caption=caption if caption else None)
-            elif tipo == "video":
-                await bot.send_video(chat_id=ID_DEL_GRUPO, video=contenido, caption=caption if caption else None)
-            print(f"🚀 [Reloj] Contenido único enviado al grupo (Bloque: {id_bloque_objetivo})")
-            
-        # Marcamos todo el bloque como enviado
-        cursor.execute("UPDATE contenidos SET enviado = 1 WHERE id_bloque = ?", (id_bloque_objetivo,))
-        conn.commit()
-        
-    except Exception as e:
-        print(f"❌ Error al enviar la publicación programada: {e}")
-        
-    finally:
-        conn.close()
-
-# =====================================================================
-# 🚀 FUNCIÓN DE ARRANQUE GENERAL
+# 🚀ARRANQUE SIMULTÁNEO DE AMBOS SISTEMAS
 # =====================================================================
 async def main():
-    inicializar_db()
+    # Enceder el cliente de Sami (Telethon)
     await client.start()
-    await bot.delete_webhook(drop_pending_updates=True)
     
-    # Programamos la tarea para que corra cada 2 horas
+    # Configurar el reloj para que publique cada 2 horas
     scheduler.add_job(publicar_contenido_cron, 'interval', hours=2)
     scheduler.start()
-    
-    print("\n👑 ==================================================")
-    print("    SISTEMA INTEGRADO PRO: BASE DE DATOS + CRON ACTIVO")
-    print("==================================================\n")
-    
-    await asyncio.gather(
-        client.run_until_disconnected(),
-        dp.start_polling(bot)
-    )
+    print("⏰ Temporizador de publicación (2 horas) activado.")
 
-if __name__ == "__main__":
+    # Encender el bot guardián (Aiogram)
+    print("👮‍♂️ Bot Guardián escuchando en directo...")
+    try:
+        await dp.start_polling()
+    finally:
+        await client.disconnect()
+
+if __name__ == '__main__':
     asyncio.run(main())
